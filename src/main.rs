@@ -1,10 +1,81 @@
-use clap::Parser;
-use client::cli::AppArgs;
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
+#![expect(rustdoc::missing_crate_level_docs)] // it's an example
+
+use eframe::egui;
+
 use client::{APP_KEY, APP_SECRET};
-use livekit::{Room, RoomEvent, RoomOptions, StreamReader, StreamTextOptions, StreamWriter};
+use egui::RichText;
+use livekit::{Room, RoomEvent, StreamReader, StreamTextOptions, StreamWriter};
 use livekit_api::access_token;
 use tokio::sync::mpsc::UnboundedReceiver;
 
+#[derive(Default)]
+enum Page {
+    #[default]
+    First,
+    Error(String),
+    Main,
+}
+
+#[derive(Default)]
+struct MyApp {
+    room_joined: bool,
+    page: Page,
+    username: String,
+    room_name: String,
+}
+
+impl MyApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Customize egui here with cc.egui_ctx.set_fonts and cc.egui_ctx.set_global_style.
+        // Restore app state using cc.storage (requires the "persistence" feature).
+        // Use the cc.gl (a glow::Context) to create graphics shaders and buffers that you can use
+        // for e.g. egui::PaintCallback.
+        Self::default()
+    }
+}
+
+impl eframe::App for MyApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ui, |ui| match &self.page {
+            Page::Main => {}
+            Page::First => {
+                ui.heading("Voice App");
+                ui.horizontal(|ui| {
+                    let name_label = ui.label("username: ");
+                    ui.text_edit_singleline(&mut self.username)
+                        .labelled_by(name_label.id);
+                });
+
+                ui.horizontal(|ui| {
+                    let room_name_label = ui.label("room name: ");
+                    ui.text_edit_singleline(&mut self.room_name)
+                        .labelled_by(room_name_label.id);
+                });
+
+                ui.horizontal(|ui| {
+                    if ui.button("Join!").clicked() {
+                        self.page = Page::Error("Join not implemented!".to_string());
+                    }
+                    if ui.button("Create!").clicked() {
+                        self.page = Page::Error("Create not implemented!".to_string());
+                    }
+                });
+            }
+            Page::Error(msg) => {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(msg));
+                });
+
+                ui.horizontal(|ui| {
+                    if ui.button("close!").clicked() {
+                        ui.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+            }
+        });
+    }
+}
 fn create_token(username: &str, room_name: &str) -> Result<String, access_token::AccessTokenError> {
     let token = access_token::AccessToken::with_api_key(APP_KEY, APP_SECRET)
         .with_identity(username)
@@ -61,17 +132,16 @@ async fn run_receiver(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
-    let args = AppArgs::parse();
-    let token = create_token(&args.username, &args.room)?;
 
-    let (room, room_events) =
-        Room::connect("http://127.0.0.1:7880", &token, RoomOptions::default()).await?;
-
-    if args.join {
-        run_receiver(room, room_events).await?;
-    } else {
-        run_sender(room).await?;
-    }
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size([320.0, 240.0]),
+        ..Default::default()
+    };
+    let _ = eframe::run_native(
+        "voicecall",
+        options,
+        Box::new(|cc| Ok(Box::new(MyApp::new(cc)))),
+    )?;
 
     Ok(())
 }
