@@ -7,7 +7,7 @@ use client::{APP_KEY, APP_SECRET, APP_URL};
 use egui::RichText;
 use livekit::{Room, RoomEvent, RoomOptions, StreamReader, StreamTextOptions, StreamWriter};
 use livekit_api::access_token;
-use log::error;
+use log::{error, info};
 use tokio::{
     runtime,
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
@@ -23,11 +23,13 @@ enum Page {
 
 enum Command {
     Join { username: String, room_name: String },
+    Participants,
 }
 
 enum UiEvent {
     Joined,
     JoinFailed(String),
+    Participants(Vec<String>),
 }
 
 struct MyApp {
@@ -38,6 +40,7 @@ struct MyApp {
     page: Page,
     username: String,
     room_name: String,
+    participants: Vec<String>,
 }
 
 struct LiveKitState {
@@ -67,6 +70,7 @@ impl MyApp {
             page: Page::First,
             username: String::new(),
             room_name: String::new(),
+            participants: Vec::new(),
         }
     }
 }
@@ -75,8 +79,15 @@ impl eframe::App for MyApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
-                UiEvent::Joined => self.page = Page::Main,
+                UiEvent::Joined => {
+                    self.page = Page::Main;
+                    // we need to ask the worker periodiocally?
+                    // but if other cleint gets dsiconnected then we selectively should
+                    // remove from participant list... maybe hashamap would be cool?
+                    let _ = self.cmd_tx.send(Command::Participants);
+                }
                 UiEvent::JoinFailed(msg) => self.page = Page::Error(msg),
+                UiEvent::Participants(participants) => self.participants = participants,
             }
         }
 
@@ -86,7 +97,18 @@ impl eframe::App for MyApp {
                     .min_size(200.0)
                     .max_size(300.0)
                     .show_separator_line(true)
-                    .show(ui, |ui| {});
+                    .show(ui, |ui| {
+                        ui.heading("Participants");
+                        ui.separator();
+
+                        if self.participants.is_empty() {
+                            ui.weak("no one yet");
+                        }
+
+                        for name in &self.participants {
+                            ui.label(name);
+                        }
+                    });
             }
             Page::First => {
                 ui.heading("Voice App");
@@ -178,19 +200,26 @@ async fn run_receiver(
     Ok(())
 }
 
-enum WorkerState {
-    Idle,
-    Joined {
-        room: Room,
-        room_events: UnboundedReceiver<RoomEvent>,
-    },
-}
-
 fn notify(event_tx: &UnboundedSender<UiEvent>, egui_ctx: &egui::Context, event: UiEvent) {
     if event_tx.send(event).is_ok() {
         // redraws the after the success
         egui_ctx.request_repaint();
     }
+}
+
+fn participant_names(room: &Room) -> Vec<String> {
+    let local = room.local_participant();
+    let mut names = vec![local.name()];
+
+    let mut remotes: Vec<String> = room
+        .remote_participants()
+        .into_values()
+        .map(|participant| participant.name())
+        .collect();
+
+    remotes.sort();
+    names.extend(remotes);
+    names
 }
 
 async fn livekit_worker(
@@ -211,8 +240,10 @@ async fn livekit_worker(
                 room_name,
             } => {
                 if livekit_state.joined {
-                    notify(&event_tx, &egui_ctx, UiEvent::Joined);
+                    info!("already joined");
+                    continue;
                 }
+
                 let token = match create_token(&username, &room_name) {
                     Ok(token) => token,
                     Err(e) => {
@@ -226,6 +257,7 @@ async fn livekit_worker(
                     Ok((room, room_events)) => {
                         livekit_state.room_events = Some(room_events);
                         livekit_state.room = Some(room);
+                        livekit_state.joined = true;
                         notify(&event_tx, &egui_ctx, UiEvent::Joined);
                     }
                     Err(e) => {
@@ -234,6 +266,14 @@ async fn livekit_worker(
                     }
                 }
             }
+            Command::Participants => match &livekit_state.room {
+                Some(room) => notify(
+                    &event_tx,
+                    &egui_ctx,
+                    UiEvent::Participants(participant_names(room)),
+                ),
+                None => info!("not joined yet"),
+            },
         }
     }
 }
