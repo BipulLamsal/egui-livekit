@@ -3,11 +3,15 @@
 
 use eframe::egui;
 
-use client::{APP_KEY, APP_SECRET};
+use client::{APP_KEY, APP_SECRET, APP_URL};
 use egui::RichText;
-use livekit::{Room, RoomEvent, StreamReader, StreamTextOptions, StreamWriter};
+use livekit::{Room, RoomEvent, RoomOptions, StreamReader, StreamTextOptions, StreamWriter};
 use livekit_api::access_token;
-use tokio::sync::mpsc::UnboundedReceiver;
+use log::error;
+use tokio::{
+    runtime,
+    sync::mpsc::{UnboundedReceiver, UnboundedSender},
+};
 
 #[derive(Default)]
 enum Page {
@@ -17,28 +21,73 @@ enum Page {
     Main,
 }
 
-#[derive(Default)]
+enum Command {
+    Join { username: String, room_name: String },
+}
+
+enum UiEvent {
+    Joined,
+    JoinFailed(String),
+}
+
 struct MyApp {
-    room_joined: bool,
+    /// runtime within the lifecycle of myapp. we can still spawn an async task inbetween
+    _rt: runtime::Runtime,
+    cmd_tx: UnboundedSender<Command>,
+    event_rx: UnboundedReceiver<UiEvent>,
     page: Page,
     username: String,
     room_name: String,
 }
 
+struct LiveKitState {
+    joined: bool,
+    room: Option<Room>,
+    room_events: Option<UnboundedReceiver<RoomEvent>>,
+}
+
 impl MyApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // Customize egui here with cc.egui_ctx.set_fonts and cc.egui_ctx.set_global_style.
-        // Restore app state using cc.storage (requires the "persistence" feature).
-        // Use the cc.gl (a glow::Context) to create graphics shaders and buffers that you can use
-        // for e.g. egui::PaintCallback.
-        Self::default()
+        let rt = runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // commands to send the egui thread from livekit thread
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        // events going back from the livekit thread to the egui thread
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        rt.spawn(livekit_worker(cmd_rx, event_tx, cc.egui_ctx.clone()));
+
+        Self {
+            _rt: rt,
+            cmd_tx,
+            event_rx,
+            page: Page::First,
+            username: String::new(),
+            room_name: String::new(),
+        }
     }
 }
 
 impl eframe::App for MyApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        while let Ok(event) = self.event_rx.try_recv() {
+            match event {
+                UiEvent::Joined => self.page = Page::Main,
+                UiEvent::JoinFailed(msg) => self.page = Page::Error(msg),
+            }
+        }
+
         egui::CentralPanel::default().show(ui, |ui| match &self.page {
-            Page::Main => {}
+            Page::Main => {
+                egui::Panel::left("participants")
+                    .min_size(200.0)
+                    .max_size(300.0)
+                    .show_separator_line(true)
+                    .show(ui, |ui| {});
+            }
             Page::First => {
                 ui.heading("Voice App");
                 ui.horizontal(|ui| {
@@ -55,10 +104,10 @@ impl eframe::App for MyApp {
 
                 ui.horizontal(|ui| {
                     if ui.button("Join!").clicked() {
-                        self.page = Page::Error("Join not implemented!".to_string());
-                    }
-                    if ui.button("Create!").clicked() {
-                        self.page = Page::Error("Create not implemented!".to_string());
+                        let _ = self.cmd_tx.send(Command::Join {
+                            username: self.username.clone(),
+                            room_name: self.room_name.clone(),
+                        });
                     }
                 });
             }
@@ -129,15 +178,75 @@ async fn run_receiver(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
+enum WorkerState {
+    Idle,
+    Joined {
+        room: Room,
+        room_events: UnboundedReceiver<RoomEvent>,
+    },
+}
+
+fn notify(event_tx: &UnboundedSender<UiEvent>, egui_ctx: &egui::Context, event: UiEvent) {
+    if event_tx.send(event).is_ok() {
+        // redraws the after the success
+        egui_ctx.request_repaint();
+    }
+}
+
+async fn livekit_worker(
+    mut cmd_rx: UnboundedReceiver<Command>,
+    event_tx: UnboundedSender<UiEvent>,
+    egui_ctx: egui::Context,
+) {
+    let mut livekit_state = LiveKitState {
+        room_events: None,
+        room: None,
+        joined: false,
+    };
+
+    while let Some(command) = cmd_rx.recv().await {
+        match command {
+            Command::Join {
+                username,
+                room_name,
+            } => {
+                if livekit_state.joined {
+                    notify(&event_tx, &egui_ctx, UiEvent::Joined);
+                }
+                let token = match create_token(&username, &room_name) {
+                    Ok(token) => token,
+                    Err(e) => {
+                        error!("token failed: {e}");
+                        notify(&event_tx, &egui_ctx, UiEvent::JoinFailed(e.to_string()));
+                        continue;
+                    }
+                };
+
+                match Room::connect(APP_URL, &token, RoomOptions::default()).await {
+                    Ok((room, room_events)) => {
+                        livekit_state.room_events = Some(room_events);
+                        livekit_state.room = Some(room);
+                        notify(&event_tx, &egui_ctx, UiEvent::Joined);
+                    }
+                    Err(e) => {
+                        error!("connect failed: {e}");
+                        notify(&event_tx, &egui_ctx, UiEvent::JoinFailed(e.to_string()));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([320.0, 240.0]),
         ..Default::default()
     };
-    let _ = eframe::run_native(
+
+    eframe::run_native(
         "voicecall",
         options,
         Box::new(|cc| Ok(Box::new(MyApp::new(cc)))),

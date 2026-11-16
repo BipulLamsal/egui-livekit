@@ -9,3 +9,6 @@ livekit.workspace = true
 livekit-api.workspace = true
 clap.workspace = true
 env_logger.workspace = true
+log.workspace = true
+egui.workspace = true
+eframe.workspace =  true
