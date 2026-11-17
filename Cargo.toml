@@ -1,14 +1,13 @@
-[package]
-name = "client"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "3"
+members = ["client", "server"]
 
-[dependencies]
-tokio.workspace = true
-livekit.workspace = true
-livekit-api.workspace = true
-clap.workspace = true
-env_logger.workspace = true
-log.workspace = true
-egui.workspace = true
-eframe.workspace =  true
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt", "net"] }
+livekit = "0.10.1"
+livekit-api = "0.10.1"
+clap = { version = "4.6.7", features = ["derive"] }
+env_logger = "0.11.11"
+log = "0.4"
+egui = {version = "0.37.0", features = ["default"]}
+eframe = "0.37.0"
