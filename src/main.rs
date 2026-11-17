@@ -7,6 +7,7 @@ use client::{APP_KEY, APP_SECRET, APP_URL};
 use egui::RichText;
 use livekit::{Room, RoomEvent, RoomOptions, StreamReader, StreamTextOptions, StreamWriter};
 use livekit_api::access_token;
+use log::debug;
 use log::error;
 use tokio::{
     runtime,
@@ -23,12 +24,14 @@ enum Page {
 
 enum Command {
     Join { username: String, room_name: String },
+    Message(String),
 }
 
 enum UiEvent {
     Joined,
     JoinFailed(String),
     Participants(Vec<String>),
+    Message((String, String)),
     Disconnected,
 }
 
@@ -41,6 +44,8 @@ struct MyApp {
     username: String,
     room_name: String,
     participants: Vec<String>,
+    messages: Vec<(String, String)>,
+    message_input_field: String,
 }
 
 impl MyApp {
@@ -65,6 +70,8 @@ impl MyApp {
             username: String::new(),
             room_name: String::new(),
             participants: Vec::new(),
+            messages: Vec::new(),
+            message_input_field: String::new(),
         }
     }
 }
@@ -78,6 +85,10 @@ impl eframe::App for MyApp {
                 }
                 UiEvent::JoinFailed(msg) => self.page = Page::Error(msg),
                 UiEvent::Participants(participants) => self.participants = participants,
+                UiEvent::Message((user, msg)) => {
+                    self.messages.push((user, msg));
+                }
+
                 UiEvent::Disconnected => {
                     self.participants.clear();
                     self.page = Page::Error("disconnected from room".to_string());
@@ -101,6 +112,47 @@ impl eframe::App for MyApp {
 
                         for name in &self.participants {
                             ui.label(name);
+                        }
+                    });
+
+                egui::Panel::bottom("message_input")
+                    .show_separator_line(true)
+                    .show(ui, |ui| {
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.message_input_field)
+                                .hint_text("type any message...")
+                                .desired_width(f32::INFINITY),
+                        );
+
+                        let enter_pressed =
+                            response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                        if enter_pressed {
+                            let text = self.message_input_field.trim().to_owned();
+
+                            if !text.is_empty() {
+                                // streaming text is for other incoming receiver not to self
+                                // so ui changes here is local and not based on event
+                                self.messages.push(("you".to_string(), text.clone()));
+                                let _ = self.cmd_tx.send(Command::Message(text));
+                                self.message_input_field.clear();
+                            }
+
+                            response.request_focus();
+                        }
+                    });
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        if self.messages.is_empty() {
+                            ui.weak("no messages yet");
+                        }
+                        // every time rerenders
+                        // bad by design
+                        for (username, text) in &self.messages {
+                            ui.label(format!("[{username}]: {text}"));
                         }
                     });
             }
@@ -155,43 +207,13 @@ fn create_token(username: &str, room_name: &str) -> Result<String, access_token:
     return token;
 }
 
-async fn run_sender(room: Room) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Running as sender");
-    let options = StreamTextOptions::new_with_topic("test-topic");
+async fn send_message(room: &Room, messsage: String) -> Result<(), Box<dyn std::error::Error>> {
+    let options = StreamTextOptions::new_with_topic("chat");
     let writer = room.local_participant().stream_text(options).await?;
-    println!("Opened the stream!");
-
-    writer
-        .write("Hello world! This is a message!\n".into())
-        .await?;
-
+    writer.write(&messsage).await?;
     writer.close().await?;
-    println!("Stream completed!");
-    Ok(())
-}
 
-async fn run_receiver(
-    _room: Room,
-    mut room_event: UnboundedReceiver<RoomEvent>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Running as receiver");
-    while let Some(msg) = room_event.recv().await {
-        match msg {
-            RoomEvent::TextStreamOpened {
-                reader,
-                topic,
-                participant_identity,
-            } => {
-                if topic == "test-topic" {
-                    if let Some(reader) = reader.take() {
-                        let result = reader.read_all().await?;
-                        println!("msg received: {:?}", result);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+    debug!("message sent by: {}", room.local_participant().name());
     Ok(())
 }
 
@@ -253,23 +275,71 @@ async fn livekit_worker(
                     }
                 }
             }
+            _ => {}
         }
     };
 
-    // after the room is connected
-    while let Some(event) = room_events.recv().await {
-        match event {
-            RoomEvent::Connected { .. }
-            | RoomEvent::ParticipantConnected(_)
-            | RoomEvent::ParticipantDisconnected(_) => {
-                notify(
-                    &event_tx,
-                    &egui_ctx,
-                    UiEvent::Participants(participant_names(&room)),
-                );
+    loop {
+        tokio::select! {
+            event = room_events.recv() => {
+                let Some(event) = event else { break };
+                match event {
+                    RoomEvent::Connected { .. }
+                    | RoomEvent::ParticipantConnected(_)
+                    | RoomEvent::ParticipantDisconnected(_) => {
+                        notify(
+                            &event_tx,
+                            &egui_ctx,
+                            UiEvent::Participants(participant_names(&room)),
+                        );
+                    }
+
+                    RoomEvent::TextStreamOpened {
+                        reader,
+                        topic,
+                        participant_identity,
+                    } => {
+                        if topic == "chat" {
+                            if let Some(reader) = reader.take() {
+                                let username = room
+                                    .remote_participants()
+                                    .get(&participant_identity)
+                                    .map(|participant| participant.name());
+
+                                // only if username exists
+                                if let Some(username) = username {
+                                    if let Ok(data) = reader.read_all().await {
+                                        notify(
+                                            &event_tx,
+                                            &egui_ctx,
+                                            UiEvent::Message((username, data)),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                };
+
             }
-            _ => {}
-        };
+            command = cmd_rx.recv() => {
+                let Some(command) = command else { break };
+                match command {
+                    Command::Message(msg) => {
+                        if send_message(&room, msg).await.is_err() {
+                            error!("bruh! msg not sent!");
+                        }
+                    }
+                    _ => {
+                        // ignore ignore
+                    }
+
+                }
+
+            }
+
+        }
     }
     // disconnected if event is none
     notify(&event_tx, &egui_ctx, UiEvent::Disconnected);
