@@ -7,7 +7,7 @@ use client::{APP_KEY, APP_SECRET, APP_URL};
 use egui::RichText;
 use livekit::{Room, RoomEvent, RoomOptions, StreamReader, StreamTextOptions, StreamWriter};
 use livekit_api::access_token;
-use log::{error, info};
+use log::error;
 use tokio::{
     runtime,
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
@@ -23,13 +23,13 @@ enum Page {
 
 enum Command {
     Join { username: String, room_name: String },
-    Participants,
 }
 
 enum UiEvent {
     Joined,
     JoinFailed(String),
     Participants(Vec<String>),
+    Disconnected,
 }
 
 struct MyApp {
@@ -41,12 +41,6 @@ struct MyApp {
     username: String,
     room_name: String,
     participants: Vec<String>,
-}
-
-struct LiveKitState {
-    joined: bool,
-    room: Option<Room>,
-    room_events: Option<UnboundedReceiver<RoomEvent>>,
 }
 
 impl MyApp {
@@ -81,13 +75,13 @@ impl eframe::App for MyApp {
             match event {
                 UiEvent::Joined => {
                     self.page = Page::Main;
-                    // we need to ask the worker periodiocally?
-                    // but if other cleint gets dsiconnected then we selectively should
-                    // remove from participant list... maybe hashamap would be cool?
-                    let _ = self.cmd_tx.send(Command::Participants);
                 }
                 UiEvent::JoinFailed(msg) => self.page = Page::Error(msg),
                 UiEvent::Participants(participants) => self.participants = participants,
+                UiEvent::Disconnected => {
+                    self.participants.clear();
+                    self.page = Page::Error("disconnected from room".to_string());
+                }
             }
         }
 
@@ -147,6 +141,7 @@ impl eframe::App for MyApp {
         });
     }
 }
+
 fn create_token(username: &str, room_name: &str) -> Result<String, access_token::AccessTokenError> {
     let token = access_token::AccessToken::with_api_key(APP_KEY, APP_SECRET)
         .with_identity(username)
@@ -227,23 +222,17 @@ async fn livekit_worker(
     event_tx: UnboundedSender<UiEvent>,
     egui_ctx: egui::Context,
 ) {
-    let mut livekit_state = LiveKitState {
-        room_events: None,
-        room: None,
-        joined: false,
-    };
+    // first command should be join
+    let (room, mut room_events) = loop {
+        let Some(command) = cmd_rx.recv().await else {
+            return;
+        };
 
-    while let Some(command) = cmd_rx.recv().await {
         match command {
             Command::Join {
                 username,
                 room_name,
             } => {
-                if livekit_state.joined {
-                    info!("already joined");
-                    continue;
-                }
-
                 let token = match create_token(&username, &room_name) {
                     Ok(token) => token,
                     Err(e) => {
@@ -255,10 +244,8 @@ async fn livekit_worker(
 
                 match Room::connect(APP_URL, &token, RoomOptions::default()).await {
                     Ok((room, room_events)) => {
-                        livekit_state.room_events = Some(room_events);
-                        livekit_state.room = Some(room);
-                        livekit_state.joined = true;
                         notify(&event_tx, &egui_ctx, UiEvent::Joined);
+                        break (room, room_events);
                     }
                     Err(e) => {
                         error!("connect failed: {e}");
@@ -266,16 +253,26 @@ async fn livekit_worker(
                     }
                 }
             }
-            Command::Participants => match &livekit_state.room {
-                Some(room) => notify(
+        }
+    };
+
+    // after the room is connected
+    while let Some(event) = room_events.recv().await {
+        match event {
+            RoomEvent::Connected { .. }
+            | RoomEvent::ParticipantConnected(_)
+            | RoomEvent::ParticipantDisconnected(_) => {
+                notify(
                     &event_tx,
                     &egui_ctx,
-                    UiEvent::Participants(participant_names(room)),
-                ),
-                None => info!("not joined yet"),
-            },
-        }
+                    UiEvent::Participants(participant_names(&room)),
+                );
+            }
+            _ => {}
+        };
     }
+    // disconnected if event is none
+    notify(&event_tx, &egui_ctx, UiEvent::Disconnected);
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
