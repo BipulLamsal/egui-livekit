@@ -5,10 +5,15 @@ use eframe::egui;
 
 use client::{APP_KEY, APP_SECRET, APP_URL};
 use egui::RichText;
-use livekit::{Room, RoomEvent, RoomOptions, StreamReader, StreamTextOptions, StreamWriter};
+use livekit::options::TrackPublishOptions;
+use livekit::track::{LocalAudioTrack, LocalTrack, TrackSource};
+use livekit::{
+    PlatformAudio, Room, RoomEvent, RoomOptions, StreamReader, StreamTextOptions, StreamWriter,
+};
 use livekit_api::access_token;
 use log::debug;
 use log::error;
+use log::info;
 use tokio::{
     runtime,
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
@@ -217,6 +222,38 @@ async fn send_message(room: &Room, messsage: String) -> Result<(), Box<dyn std::
     Ok(())
 }
 
+async fn publish_microphone(room: &Room, audio: &PlatformAudio) {
+    if let Some(device) = audio.recording_devices().next() {
+        if let Err(e) = audio.set_recording_device(&device.id) {
+            error!("failed to select microphone: {e}");
+        }
+    } else {
+        error!("no recording devices found");
+    }
+
+    if let Some(device) = audio.playout_devices().next() {
+        if let Err(e) = audio.set_playout_device(&device.id) {
+            error!("failed to select speaker: {e}");
+        }
+    } else {
+        error!("no playout devices found");
+    }
+
+    let track = LocalAudioTrack::create_audio_track("microphone", audio.rtc_source());
+    let options = TrackPublishOptions {
+        source: TrackSource::Microphone,
+        ..Default::default()
+    };
+
+    if let Err(e) = room
+        .local_participant()
+        .publish_track(LocalTrack::Audio(track), options)
+        .await
+    {
+        error!("failed to publish microphone: {e}");
+    }
+}
+
 fn notify(event_tx: &UnboundedSender<UiEvent>, egui_ctx: &egui::Context, event: UiEvent) {
     if event_tx.send(event).is_ok() {
         // redraws the after the success
@@ -244,6 +281,17 @@ async fn livekit_worker(
     event_tx: UnboundedSender<UiEvent>,
     egui_ctx: egui::Context,
 ) {
+    let platform_audio = match PlatformAudio::new() {
+        Ok(audio) => {
+            info!("platform audio is ready!");
+            Some(audio)
+        }
+        Err(e) => {
+            error!("platform audio unavailable: {e}");
+            None
+        }
+    };
+
     // first command should be join
     let (room, mut room_events) = loop {
         let Some(command) = cmd_rx.recv().await else {
@@ -278,6 +326,10 @@ async fn livekit_worker(
             _ => {}
         }
     };
+
+    if let Some(audio) = &platform_audio {
+        publish_microphone(&room, audio).await;
+    }
 
     loop {
         tokio::select! {
