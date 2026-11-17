@@ -10,9 +10,9 @@ livekit-server --dev --bind 0.0.0.0
 ![base](images/base.png)
 
 
-[X] setup with rust sdk with livekit server 
-[X] pretty basic client with rooms to share text? (signaling setup)
-[X] stream media over the media backend plane just capture the host audio and transmit 
+- [X] setup with rust sdk with livekit server 
+- [X] pretty basic client with rooms to share text? (signaling setup)
+- [X] stream media over the media backend plane just capture the host audio and transmit 
 
 
 ### References
